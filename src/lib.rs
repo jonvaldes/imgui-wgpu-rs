@@ -1,14 +1,14 @@
 use imgui::{
     Context, DrawCmd::Elements, DrawData, DrawIdx, DrawList, DrawVert, TextureId, Textures,
 };
+
+use std::borrow::Cow::Borrowed;
 use std::mem::size_of;
 use wgpu::*;
 
-pub type RendererResult<T> = Result<T, RendererError>;
+use wgpu::util::DeviceExt;
 
-// TODO: This value may change
-// https://github.com/gfx-rs/wgpu-rs/issues/199
-const WHOLE_BUFFER: u64 = 0;
+pub type RendererResult<T> = Result<T, RendererError>;
 
 #[derive(Clone, Debug)]
 pub enum RendererError {
@@ -27,7 +27,7 @@ struct Shaders;
 
 #[cfg(feature = "glsl-to-spirv")]
 impl Shaders {
-    fn compile_glsl(code: &str, stage: ShaderStage) -> Vec<u32> {
+    fn compile_glsl(code: &str, stage: ShaderStage) -> Vec<u8> {
         let ty = match stage {
             ShaderStage::Vertex => glsl_to_spirv::ShaderType::Vertex,
             ShaderStage::Fragment => glsl_to_spirv::ShaderType::Fragment,
@@ -63,23 +63,24 @@ impl Texture {
             mipmap_filter: FilterMode::Linear,
             lod_min_clamp: -100.0,
             lod_max_clamp: 100.0,
-            compare: CompareFunction::Always,
+            compare: Some(CompareFunction::Always),
+            ..Default::default()
         });
 
         // Create the texture bind group from the layout.
         let bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: None,
             layout,
-            bindings: &[
-                Binding {
+            entries: Borrowed(&[
+                BindGroupEntry {
                     binding: 0,
                     resource: BindingResource::TextureView(&view),
                 },
-                Binding {
+                BindGroupEntry {
                     binding: 1,
                     resource: BindingResource::Sampler(&sampler),
                 },
-            ],
+            ]),
         });
 
         Texture { bind_group }
@@ -125,24 +126,14 @@ impl Renderer {
         let vs_bytes = include_bytes!("imgui.vert.spv");
         let fs_bytes = include_bytes!("imgui.frag.spv");
 
-        fn compile(shader: &[u8]) -> Vec<u32> {
-            let mut words = vec![];
-            for bytes4 in shader.chunks(4) {
-                words.push(u32::from_le_bytes([
-                    bytes4[0], bytes4[1], bytes4[2], bytes4[3],
-                ]));
-            }
-            words
-        }
-
         Self::new_impl(
             imgui,
             device,
             queue,
             format,
             clear_color,
-            compile(vs_bytes),
-            compile(fs_bytes),
+            vs_bytes.to_vec(),
+            fs_bytes.to_vec(),
         )
     }
 
@@ -164,12 +155,12 @@ impl Renderer {
         queue: &mut Queue,
         format: TextureFormat,
         clear_color: Option<Color>,
-        vs_raw: Vec<u32>,
-        fs_raw: Vec<u32>,
+        vs_raw: Vec<u8>,
+        fs_raw: Vec<u8>,
     ) -> Renderer {
         // Load shaders.
-        let vs_module = device.create_shader_module(&vs_raw);
-        let fs_module = device.create_shader_module(&fs_raw);
+        let vs_module = device.create_shader_module(wgpu::util::make_spirv(&vs_raw));
+        let fs_module = device.create_shader_module(wgpu::util::make_spirv(&fs_raw));
 
         // Create the uniform matrix buffer.
         let size = 64;
@@ -177,55 +168,57 @@ impl Renderer {
             label: None,
             size,
             usage: BufferUsage::UNIFORM | BufferUsage::COPY_DST,
+            mapped_at_creation: true,
         });
 
         // Create the uniform matrix buffer bind group layout.
         let uniform_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: None,
-            bindings: &[BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStage::VERTEX,
-                ty: BindingType::UniformBuffer { dynamic: false },
-            }],
+            entries: Borrowed(&[BindGroupLayoutEntry::new(
+                0,
+                wgpu::ShaderStage::VERTEX,
+                BindingType::UniformBuffer {
+                    dynamic: false,
+                    min_binding_size: wgpu::BufferSize::new(64),
+                },
+            )]),
         });
 
         // Create the uniform matrix buffer bind group.
         let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
             label: None,
             layout: &uniform_layout,
-            bindings: &[Binding {
+            entries: Borrowed(&[BindGroupEntry {
                 binding: 0,
-                resource: BindingResource::Buffer {
-                    buffer: &uniform_buffer,
-                    range: 0..size,
-                },
-            }],
+                resource: wgpu::BindingResource::Buffer(uniform_buffer.slice(..)),
+            }]),
         });
 
         // Create the texture layout for further usage.
         let texture_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: None,
-            bindings: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStage::FRAGMENT,
-                    ty: BindingType::SampledTexture {
+            entries: Borrowed(&[
+                BindGroupLayoutEntry::new(
+                    0,
+                    wgpu::ShaderStage::FRAGMENT,
+                    BindingType::SampledTexture {
                         multisampled: false,
                         component_type: TextureComponentType::Float,
                         dimension: TextureViewDimension::D2,
                     },
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStage::FRAGMENT,
-                    ty: BindingType::Sampler { comparison: false },
-                },
-            ],
+                ),
+                BindGroupLayoutEntry::new(
+                    1,
+                    wgpu::ShaderStage::FRAGMENT,
+                    BindingType::Sampler { comparison: false },
+                ),
+            ]),
         });
 
         // Create the render pipeline layout.
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            bind_group_layouts: &[&uniform_layout, &texture_layout],
+            bind_group_layouts: Borrowed(&[&uniform_layout, &texture_layout]),
+            push_constant_ranges: Borrowed(&[]),
         });
 
         // Create the render pipeline.
@@ -233,11 +226,11 @@ impl Renderer {
             layout: &pipeline_layout,
             vertex_stage: ProgrammableStageDescriptor {
                 module: &vs_module,
-                entry_point: "main",
+                entry_point: Borrowed("main"),
             },
             fragment_stage: Some(ProgrammableStageDescriptor {
                 module: &fs_module,
-                entry_point: "main",
+                entry_point: Borrowed("main"),
             }),
             rasterization_state: Some(RasterizationStateDescriptor {
                 front_face: FrontFace::Cw,
@@ -245,9 +238,10 @@ impl Renderer {
                 depth_bias: 0,
                 depth_bias_slope_scale: 0.0,
                 depth_bias_clamp: 0.0,
+                ..Default::default()
             }),
             primitive_topology: PrimitiveTopology::TriangleList,
-            color_states: &[ColorStateDescriptor {
+            color_states: Borrowed(&[ColorStateDescriptor {
                 format,
                 color_blend: BlendDescriptor {
                     src_factor: BlendFactor::SrcAlpha,
@@ -260,14 +254,14 @@ impl Renderer {
                     operation: BlendOperation::Add,
                 },
                 write_mask: ColorWrite::ALL,
-            }],
+            }]),
             depth_stencil_state: None,
             vertex_state: VertexStateDescriptor {
                 index_format: IndexFormat::Uint16,
-                vertex_buffers: &[VertexBufferDescriptor {
+                vertex_buffers: Borrowed(&[VertexBufferDescriptor {
                     stride: size_of::<DrawVert>() as BufferAddress,
                     step_mode: InputStepMode::Vertex,
-                    attributes: &[
+                    attributes: Borrowed(&[
                         VertexAttributeDescriptor {
                             format: VertexFormat::Float2,
                             shader_location: 0,
@@ -283,8 +277,8 @@ impl Renderer {
                             shader_location: 2,
                             offset: 16,
                         },
-                    ],
-                }],
+                    ]),
+                }]),
             },
             sample_count: 1,
             sample_mask: !0,
@@ -345,21 +339,19 @@ impl Renderer {
 
         // Start a new renderpass and prepare it properly.
         let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
-            color_attachments: &[RenderPassColorAttachmentDescriptor {
+            color_attachments: Borrowed(&[RenderPassColorAttachmentDescriptor {
                 attachment: &view,
                 resolve_target: None,
-                load_op: match self.clear_color {
-                    Some(_) => LoadOp::Clear,
-                    _ => LoadOp::Load,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(self.clear_color.unwrap_or(Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    })),
+                    store: true,
                 },
-                store_op: StoreOp::Store,
-                clear_color: self.clear_color.unwrap_or(Color {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                }),
-            }],
+            }]),
             depth_stencil_attachment: None,
         });
         rpass.set_pipeline(&self.pipeline);
@@ -404,8 +396,8 @@ impl Renderer {
         let vertex_buffer = &self.vertex_buffers[draw_list_buffers_index];
 
         // Make sure the current buffers are attached to the render pass.
-        rpass.set_index_buffer(&index_buffer, 0, WHOLE_BUFFER);
-        rpass.set_vertex_buffer(0, &vertex_buffer, 0, WHOLE_BUFFER);
+        rpass.set_index_buffer(index_buffer.slice(..));
+        rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
 
         for cmd in draw_list.commands() {
             match cmd {
@@ -454,7 +446,11 @@ impl Renderer {
     ) {
         let data = as_byte_slice(matrix);
         // Create a new buffer.
-        let buffer = device.create_buffer_with_data(data, BufferUsage::COPY_SRC);
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: data,
+            usage: BufferUsage::COPY_SRC,
+        });
 
         // Copy the new buffer to the real buffer.
         encoder.copy_buffer_to_buffer(&buffer, 0, &self.uniform_buffer, 0, 64);
@@ -463,13 +459,21 @@ impl Renderer {
     /// Upload the vertex buffer to the gPU.
     fn upload_vertex_buffer(&self, device: &Device, vertices: &[DrawVert]) -> Buffer {
         let data = as_byte_slice(&vertices);
-        device.create_buffer_with_data(data, BufferUsage::VERTEX)
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: data,
+            usage: BufferUsage::VERTEX,
+        })
     }
 
     /// Upload the index buffer to the GPU.
     fn upload_index_buffer(&self, device: &Device, indices: &[DrawIdx]) -> Buffer {
         let data = as_byte_slice(&indices);
-        device.create_buffer_with_data(data, BufferUsage::INDEX)
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: data,
+            usage: BufferUsage::INDEX,
+        })
     }
 
     /// Updates the texture on the GPU corresponding to the current imgui font atlas.
@@ -501,7 +505,6 @@ impl Renderer {
                 height,
                 depth: 1,
             },
-            array_layer_count: 1,
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
@@ -511,7 +514,11 @@ impl Renderer {
 
         // Upload the actual data to a wgpu buffer.
         let bytes = data.len();
-        let buffer = device.create_buffer_with_data(data, BufferUsage::COPY_SRC);
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: data,
+            usage: BufferUsage::COPY_SRC,
+        });
 
         // Make sure we have an active encoder.
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: None });
@@ -520,14 +527,15 @@ impl Renderer {
         encoder.copy_buffer_to_texture(
             BufferCopyView {
                 buffer: &buffer,
-                offset: 0,
-                bytes_per_row: bytes as u32 / height,
-                rows_per_image: height,
+                layout: TextureDataLayout {
+                    offset: 0,
+                    bytes_per_row: bytes as u32 / height,
+                    rows_per_image: height,
+                },
             },
             TextureCopyView {
                 texture: &texture,
                 mip_level: 0,
-                array_layer: 0,
                 origin: Origin3d { x: 0, y: 0, z: 0 },
             },
             Extent3d {
@@ -538,7 +546,7 @@ impl Renderer {
         );
 
         // Resolve the actual copy process.
-        queue.submit(&[encoder.finish()]);
+        queue.submit(Some(encoder.finish()));
 
         let texture = Texture::new(texture, &self.texture_layout, device);
         self.textures.insert(texture)
