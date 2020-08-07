@@ -210,7 +210,7 @@ impl Renderer {
                 BindGroupLayoutEntry::new(
                     1,
                     wgpu::ShaderStage::FRAGMENT,
-                    BindingType::Sampler { comparison: false },
+                    BindingType::Sampler { comparison: true},
                 ),
             ]),
         });
